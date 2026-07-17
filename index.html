@@ -240,6 +240,28 @@
   .savepill{position:fixed;bottom:18px;right:18px;background:var(--ink);color:#fff;font-size:12px;
     font-weight:700;padding:9px 15px;border-radius:20px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:50}
   .savepill.show{opacity:.95}
+
+  /* live edit popup from the other editor */
+  .livepop{position:fixed;bottom:58px;right:18px;background:#fff;color:var(--ink);
+    border:2px solid var(--navy);border-radius:12px;padding:11px 15px 11px 13px;
+    display:flex;align-items:center;gap:10px;box-shadow:0 8px 24px rgba(0,0,0,.22);
+    font-size:13.5px;font-weight:600;max-width:300px;opacity:0;transform:translateY(8px);
+    transition:opacity .25s,transform .25s;pointer-events:none;z-index:60}
+  .livepop.show{opacity:1;transform:translateY(0)}
+  .livepop .lp-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+  .livepop .lp-live{color:#fff;font-size:9px;font-weight:900;letter-spacing:.8px;
+    padding:2px 6px;border-radius:4px;flex-shrink:0}
+  .livepop .lp-txt{line-height:1.35}
+  @media print{ .livepop{display:none!important} }
+
+  /* "Editing as NAME (change)" header indicator */
+  #editorTag{font-size:11.5px;color:var(--silver);letter-spacing:.3px;display:flex;
+    align-items:center;gap:6px;white-space:nowrap}
+  #editorTag b{color:#fff;font-weight:700}
+  #editorTag button{background:transparent;border:1px solid #444;color:#cfd4da;
+    font-size:10.5px;font-weight:600;padding:3px 8px;border-radius:5px;cursor:pointer;letter-spacing:.2px}
+  #editorTag button:hover{border-color:var(--gold);color:var(--gold)}
+  @media print{ #editorTag{display:none!important} }
   @media (max-width:560px){
     .top img{height:72px}.top .titles h1{font-size:16px}
     main{padding:20px 14px 70px}.div-head h2{font-size:20px}
@@ -273,6 +295,7 @@
       <p>Female Super League &middot; Playoffs</p>
     </div>
     <div class="spacer"></div>
+    <div id="editorTag"></div>
     <button class="primary" onclick="importIceTimes()">Import ice times</button>
     <button onclick="downloadTimeTemplate()">Time template</button>
     <button id="undoBtn" onclick="undo()" disabled>Undo</button>
@@ -404,6 +427,60 @@ const FB_DOC = "playoffs/fsl_playoffs_v1";   // collection/document holding STAT
 let FB_DB = null;             // Firestore handle once ready
 let FB_READY = false;
 let FB_APPLYING = false;      // true while writing a remote snapshot into STATE (suppresses echo)
+let FB_FIRST_SNAP = true;     // skip popup on the very first snapshot (initial load, not a live edit)
+
+/* ---------- EDITOR IDENTITY ----------
+   The editor's name lives in localStorage, NOT in STATE, so it's per-device and
+   never overwritten by a sync. Each cloud write is tagged with this name + a
+   random editId so the receiver can tell a real remote edit from its own echo. */
+const NAME_KEY = "fsl_editor_name";
+let EDITOR_NAME = localStorage.getItem(NAME_KEY) || "";
+let MY_LAST_EDIT_ID = "";      // the editId of our most recent write
+
+function randId(){ return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+
+function ensureEditorName(force){
+  if(EDITOR_NAME && !force) return EDITOR_NAME;
+  let n = null;
+  try{ n = window.prompt("Enter your name (shown to the other editor when you make a change):", EDITOR_NAME || ""); }catch(e){}
+  if(n && n.trim()){ EDITOR_NAME = n.trim(); localStorage.setItem(NAME_KEY, EDITOR_NAME); }
+  else if(!EDITOR_NAME){ EDITOR_NAME = "Editor"; }   // fallback so tagging still works
+  renderEditorTag();
+  return EDITOR_NAME;
+}
+
+/* Small "Editing as: NAME (change)" indicator in the header. */
+function renderEditorTag(){
+  const el = document.getElementById('editorTag');
+  if(!el) return;
+  el.innerHTML = `Editing as <b>${escapeHtmlLite(EDITOR_NAME||'…')}</b> <button type="button" id="editorChange">change</button>`;
+  const btn = document.getElementById('editorChange');
+  if(btn) btn.addEventListener('click', ()=>ensureEditorName(true));
+}
+function escapeHtmlLite(s){ return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* Deterministic color per name, so each person's popups look consistent. */
+function nameColor(name){
+  let h=0; for(let i=0;i<name.length;i++){ h=(h*31 + name.charCodeAt(i))>>>0; }
+  return `hsl(${h%360} 65% 42%)`;
+}
+
+/* Big, friendly toast when the OTHER person makes a live edit. */
+function livePopup(name){
+  let box = document.getElementById('livepop');
+  if(!box){
+    box = document.createElement('div'); box.id='livepop'; box.className='livepop';
+    document.body.appendChild(box);
+  }
+  const col = nameColor(name);
+  box.style.borderColor = col;
+  box.innerHTML = `<span class="lp-dot" style="background:${col}"></span>
+    <span class="lp-live" style="background:${col}">LIVE</span>
+    <span class="lp-txt"><b>${escapeHtmlLite(name)}</b> just updated the scores</span>`;
+  box.classList.add('show');
+  clearTimeout(livePopup._t);
+  livePopup._t = setTimeout(()=>box.classList.remove('show'), 3200);
+}
 
 function loadScript(src){
   return new Promise((res,rej)=>{ const s=document.createElement('script');
@@ -418,15 +495,26 @@ async function initFirebase(){
     // Live listener: any change made anywhere updates every open device.
     FB_DB.doc(FB_DOC).onSnapshot(snap=>{
       if(!snap.exists) return;
-      const data = snap.data() && snap.data().state;
+      const doc = snap.data() || {};
+      const data = doc.state;
       if(!data) return;
       const incoming = JSON.stringify(data);
+      const firstSnap = FB_FIRST_SNAP;
+      FB_FIRST_SNAP = false;
       if(incoming===COMMITTED) return;         // it's our own write coming back
       FB_APPLYING = true;
       STATE = data; COMMITTED = incoming;
       localStorage.setItem(STORE_KEY, incoming);
-      renderContent(); flashPill('Synced');
+      renderContent();
       FB_APPLYING = false;
+      // Only announce genuine live edits from the OTHER editor — not our own
+      // echoes, and not the initial state that loads when the page opens.
+      const fromOther = doc.editId && doc.editId !== MY_LAST_EDIT_ID;
+      if(!firstSnap && fromOther){
+        livePopup(doc.editor || "Someone");
+      } else {
+        flashPill('Synced');
+      }
     }, err=>console.warn("Firestore listen failed:", err));
     // Push whatever is on this device now, in case the cloud doc is empty.
     pushToCloud();
@@ -437,8 +525,13 @@ async function initFirebase(){
 }
 function pushToCloud(){
   if(!FB_READY || FB_APPLYING) return;
-  FB_DB.doc(FB_DOC).set({ state: STATE, updated: Date.now() })
-    .catch(err=>console.warn("Cloud save failed:", err));
+  MY_LAST_EDIT_ID = randId();
+  FB_DB.doc(FB_DOC).set({
+    state: STATE,
+    updated: Date.now(),
+    editor: EDITOR_NAME || "Editor",
+    editId: MY_LAST_EDIT_ID
+  }).catch(err=>console.warn("Cloud save failed:", err));
 }
 
 /* ---------- STATE / PERSISTENCE ---------- */
@@ -1910,6 +2003,8 @@ window.addEventListener('keydown', e=>{
 renderTabs();
 renderContent();
 updateUndoBtn();
+renderEditorTag();
+ensureEditorName();   // ask who you are (skipped if already saved on this device)
 initFirebase();
 </script>
 </body>
